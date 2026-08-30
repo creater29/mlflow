@@ -166,6 +166,81 @@ jobs:
           echo "three-ways outcome: $OUTCOME"
           echo "A failure here is the expected shape of docker/sbx-releases#53."
 
+      # Spike 3. The gateway path `review` actually uses: a Databricks bearer
+      # rather than an Anthropic key, reached at a host the `balanced` policy
+      # blocks by default. `set-custom` should keep the bearer on the host and
+      # leave only a placeholder in the VM.
+      - name: Configure the gateway credential
+        env:
+          DATABRICKS_GATEWAY_HOST: ${{ secrets.DATABRICKS_GATEWAY_HOST }}
+          DATABRICKS_GATEWAY_CLIENT_ID: ${{ secrets.DATABRICKS_GATEWAY_CLIENT_ID }}
+          DATABRICKS_GATEWAY_CLIENT_SECRET: ${{ secrets.DATABRICKS_GATEWAY_CLIENT_SECRET }}
+        run: |
+          # An OAuth token or api key on the `anthropic` service takes precedence
+          # at runtime, so spike 2's key has to go before this means anything.
+          sbx secret rm anthropic -f || true
+
+          TOKEN=$(curl -sS --max-time 15 \
+            -u "$DATABRICKS_GATEWAY_CLIENT_ID:$DATABRICKS_GATEWAY_CLIENT_SECRET" \
+            -d grant_type=client_credentials -d scope=ai-gateway \
+            "$DATABRICKS_GATEWAY_HOST/oidc/v1/token" | jq -r '.access_token // empty')
+          if [ -z "$TOKEN" ]; then
+            echo "::error::gateway token exchange failed"
+            exit 1
+          fi
+          # Minted at runtime, so not masked automatically.
+          echo "::add-mask::$TOKEN"
+
+          host=${DATABRICKS_GATEWAY_HOST#https://}
+          host=${host%%/*}
+          echo "::add-mask::$host"
+
+          base_url="${DATABRICKS_GATEWAY_HOST%/}/ai-gateway/anthropic"
+          echo "::add-mask::$base_url"
+          echo "ANTHROPIC_BASE_URL=$base_url" >> "$GITHUB_ENV"
+          tags=$(jq -cn --arg repository "$GITHUB_REPOSITORY" --arg task sbx-spike '{$repository, $task}')
+          echo "ANTHROPIC_CUSTOM_HEADERS=Databricks-Ai-Gateway-Request-Tags: $tags" >> "$GITHUB_ENV"
+
+          # Global rather than --sandbox: a custom secret has to exist before the
+          # sandbox is created for its env var to be injected at all.
+          sbx policy allow network "$host"
+          sbx secret set-custom --host "$host" --env ANTHROPIC_AUTH_TOKEN --token "$TOKEN"
+          sbx secret ls
+
+      - name: Create the gateway sandbox
+        run: |
+          # ANTHROPIC_AUTH_TOKEN is deliberately absent here: set-custom injects
+          # the placeholder, and passing the real bearer would defeat the point.
+          echo "y" | sbx create claude "$GITHUB_WORKSPACE" --name gw-spike \
+            -e ANTHROPIC_BASE_URL -e ANTHROPIC_CUSTOM_HEADERS
+
+      - name: Verify the bearer never entered the VM
+        run: |
+          # shellcheck disable=SC2016  # must expand inside the VM, not here
+          inside=$(sbx exec gw-spike bash -lc 'printf "%s" "$ANTHROPIC_AUTH_TOKEN"')
+          if [ -z "$inside" ]; then
+            echo "::error::ANTHROPIC_AUTH_TOKEN was not injected into the sandbox"
+            exit 1
+          fi
+          case "$inside" in
+            sbx-cs-*) echo "VM holds a placeholder (${inside%%-*}-cs-...), not the bearer" ;;
+            *) echo "::error::ANTHROPIC_AUTH_TOKEN in the VM is not a placeholder"; exit 1 ;;
+          esac
+
+      - name: Run claude through the gateway
+        id: gateway-claude
+        continue-on-error: true
+        run: |
+          marker="SPIKE3_OK"
+          out=$(timeout 300 sbx exec gw-spike claude -p "Reply with exactly: $marker" 2>&1) || true
+          if grep -q "$marker" <<<"$out"; then
+            echo "gateway: PASS"
+          else
+            echo "gateway: FAIL"
+            sed -n '1,15p' <<<"$out" | sed 's/^/    /'
+            exit 1
+          fi
+
       - name: Diagnostics
         if: always()
         run: |
@@ -175,7 +250,7 @@ jobs:
       - name: Tear down
         if: always()
         run: |
-          for s in spike claude-spike; do
+          for s in spike claude-spike gw-spike; do
             sbx stop "$s" || true
             sbx rm --force "$s" || true
           done
