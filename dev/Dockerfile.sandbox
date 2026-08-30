@@ -11,6 +11,18 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.14 /uv /uvx /usr/local/bin/
 
 USER root
 
+# The base ships no fonts and no fontconfig, so Chrome falls back to a face with
+# no usable metrics and screenshots come out with mangled word and digit
+# spacing. Liberation covers the Arial/Helvetica/Times metrics the UI asks for,
+# DejaVu the rest, and the emoji face avoids tofu boxes.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+       fontconfig \
+       fonts-liberation \
+       fonts-dejavu-core \
+       fonts-noto-color-emoji \
+  && rm -rf /var/lib/apt/lists/*
+
 # The base has no xz, hence the .tar.gz. Checksum from
 # https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt.
 RUN curl -fsSL --retry 3 "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz" -o /tmp/node.tar.gz \
