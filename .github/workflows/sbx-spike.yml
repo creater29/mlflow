@@ -208,11 +208,20 @@ jobs:
           sbx secret ls
 
       - name: Create the gateway sandbox
+        env:
+          # The same three `review` sets. The permission classifier picks its
+          # model from the aliases rather than `--model`, and the gateway's beta
+          # allowlist rejects some of the CLI's experimental betas with 400.
+          ANTHROPIC_DEFAULT_SONNET_MODEL: databricks-claude-sonnet-5
+          ANTHROPIC_DEFAULT_OPUS_MODEL: databricks-claude-opus-5
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
         run: |
           # ANTHROPIC_AUTH_TOKEN is deliberately absent here: set-custom injects
           # the placeholder, and passing the real bearer would defeat the point.
           echo "y" | sbx create claude "$GITHUB_WORKSPACE" --name gw-spike \
-            -e ANTHROPIC_BASE_URL -e ANTHROPIC_CUSTOM_HEADERS
+            -e ANTHROPIC_BASE_URL -e ANTHROPIC_CUSTOM_HEADERS \
+            -e ANTHROPIC_DEFAULT_SONNET_MODEL -e ANTHROPIC_DEFAULT_OPUS_MODEL \
+            -e CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
 
       - name: Verify the bearer never entered the VM
         run: |
@@ -232,7 +241,10 @@ jobs:
         continue-on-error: true
         run: |
           marker="SPIKE3_OK"
-          out=$(timeout 300 sbx exec gw-spike claude -p "Reply with exactly: $marker" 2>&1) || true
+          # The gateway names each endpoint `databricks-<model>`; the CLI's own
+          # default is not one it serves.
+          out=$(timeout 300 sbx exec gw-spike \
+            claude --model databricks-claude-sonnet-5 -p "Reply with exactly: $marker" 2>&1) || true
           if grep -q "$marker" <<<"$out"; then
             echo "gateway: PASS"
           else
