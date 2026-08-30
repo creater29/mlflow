@@ -403,3 +403,138 @@ jobs:
         run: |
           sbx stop ui-spike || true
           sbx rm --force ui-spike || true
+
+  # Spike 5. Same task, weaker and cheaper boundaries, to price what sbx's
+  # microVM actually costs. gVisor needs no KVM and no account; the hardened
+  # container shares the runner's kernel and is the cheapest thing that still
+  # keeps PR code away from the job's other credentials. Reuses the same image,
+  # so the only variable is the runtime.
+  runtimes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Build the image
+        run: docker build -f dev/Dockerfile.sandbox -t mlflow-sandbox:spike .
+
+      - name: Install gVisor
+        run: |
+          curl -fsSL https://gvisor.dev/archive.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+            | sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y runsc
+          sudo runsc install
+          sudo systemctl restart docker
+          docker info --format '{{.Runtimes}}'
+
+      - name: Write the smoke script
+        run: |
+          cat > /tmp/smoke.sh <<'SH'
+          #!/usr/bin/env bash
+          # Boot the dev server and screenshot the home page, timing each phase.
+          set -euo pipefail
+          label=$1
+          out=/work/out
+          mkdir -p "$out"
+          cd /work
+
+          overall=$(date +%s)
+          t=$(date +%s)
+          uv sync --quiet
+          echo "[$label] uv sync: $(( $(date +%s) - t ))s"
+
+          t=$(date +%s)
+          uv run python -c "from mlflow.demo import generate_all_demos; generate_all_demos(refresh=True)" > /dev/null 2>&1
+          echo "[$label] demo seed: $(( $(date +%s) - t ))s"
+
+          t=$(date +%s)
+          nohup uv run dev/run_dev_server.py --stub-providers claude > "$out/dev-server.log" 2>&1 &
+          url=""
+          for _ in $(seq 1 150); do
+            if [ -z "$url" ]; then
+              url=$(grep -oE 'Frontend: http://localhost:[0-9]+' "$out/dev-server.log" 2>/dev/null | head -1 | grep -oE 'http://localhost:[0-9]+' || true)
+            fi
+            if [ -n "$url" ] && curl -fsS "$url" > /dev/null 2>&1; then
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$url" ] || ! curl -fsS "$url" > /dev/null 2>&1; then
+            echo "[$label] FAIL: dev server never became ready"
+            tail -40 "$out/dev-server.log"
+            exit 1
+          fi
+          echo "[$label] dev server: $(( $(date +%s) - t ))s ($url)"
+
+          t=$(date +%s)
+          agent-browser open "$url"
+          agent-browser wait 3000
+          agent-browser screenshot "$out/home.png"
+          echo "[$label] screenshot: $(( $(date +%s) - t ))s"
+          ls -la "$out/home.png"
+          echo "[$label] TOTAL: $(( $(date +%s) - overall ))s"
+          SH
+          chmod +x /tmp/smoke.sh
+
+      # A clone per arm, so neither reuses the other's .venv or node_modules and
+      # the timings mean something. --local hardlinks, so it is nearly free.
+      - name: Prepare a workspace per arm
+        run: |
+          for arm in plain runsc; do
+            git clone --local --quiet "$GITHUB_WORKSPACE" "/tmp/arm-$arm"
+            chmod -R a+rwX "/tmp/arm-$arm"
+          done
+
+      - name: Arm 1, hardened container on the shared kernel
+        id: arm-plain
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            --cap-drop=ALL \
+            --security-opt no-new-privileges \
+            -v /tmp/arm-plain:/work -v /tmp/smoke.sh:/smoke.sh:ro \
+            -e CI=false -e MLFLOW_TRACKING_URI=sqlite:////tmp/mlflow.db \
+            mlflow-sandbox:spike bash /smoke.sh plain
+
+      - name: Arm 2, gVisor
+        id: arm-runsc
+        continue-on-error: true
+        run: |
+          docker run --rm --runtime=runsc \
+            --cap-drop=ALL \
+            --security-opt no-new-privileges \
+            -v /tmp/arm-runsc:/work -v /tmp/smoke.sh:/smoke.sh:ro \
+            -e CI=false -e MLFLOW_TRACKING_URI=sqlite:////tmp/mlflow.db \
+            mlflow-sandbox:spike bash /smoke.sh runsc
+
+      - name: Collect
+        if: always()
+        env:
+          PLAIN: ${{ steps.arm-plain.outcome }}
+          RUNSC: ${{ steps.arm-runsc.outcome }}
+        run: |
+          echo "plain=$PLAIN runsc=$RUNSC"
+          mkdir -p /tmp/runtime-out
+          for arm in plain runsc; do
+            if [ -d "/tmp/arm-$arm/out" ]; then
+              mkdir -p "/tmp/runtime-out/$arm"
+              cp -a "/tmp/arm-$arm/out/." "/tmp/runtime-out/$arm/" || true
+            fi
+          done
+          find /tmp/runtime-out -type f -exec ls -la {} \;
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: runtime-comparison
+          path: /tmp/runtime-out
+          if-no-files-found: warn
+          retention-days: 1
