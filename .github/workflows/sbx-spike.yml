@@ -695,3 +695,155 @@ jobs:
         run: |
           docker rm -f gw-proxy || true
           docker network rm spike-net || true
+
+  # Everything at once: the custom image, under gVisor, reaching the gateway
+  # only through the injecting proxy, doing the real UI task. This is the shape
+  # `review` would actually take.
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Build the image
+        run: docker build -f dev/Dockerfile.sandbox -t mlflow-sandbox:spike .
+
+      - name: Install gVisor
+        run: |
+          curl -fsSL https://gvisor.dev/archive.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+            | sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y runsc
+          sudo runsc install
+          sudo systemctl restart docker
+
+      # Published on the host rather than sitting on a user-defined network. On
+      # one of those, Docker routes every lookup through its embedded resolver at
+      # 127.0.0.11, which gVisor's own netstack cannot reach, so the sandbox
+      # would lose external DNS and `uv sync` with it. The default bridge keeps
+      # real resolvers in resolv.conf, which spike 5 already proved works.
+      - name: Start the injecting proxy
+        env:
+          DATABRICKS_GATEWAY_HOST: ${{ secrets.DATABRICKS_GATEWAY_HOST }}
+          DATABRICKS_GATEWAY_CLIENT_ID: ${{ secrets.DATABRICKS_GATEWAY_CLIENT_ID }}
+          DATABRICKS_GATEWAY_CLIENT_SECRET: ${{ secrets.DATABRICKS_GATEWAY_CLIENT_SECRET }}
+        run: |
+          GW_TOKEN=$(curl -sS --max-time 15 \
+            -u "$DATABRICKS_GATEWAY_CLIENT_ID:$DATABRICKS_GATEWAY_CLIENT_SECRET" \
+            -d grant_type=client_credentials -d scope=ai-gateway \
+            "$DATABRICKS_GATEWAY_HOST/oidc/v1/token" | jq -r '.access_token // empty')
+          if [ -z "$GW_TOKEN" ]; then
+            echo "::error::gateway token exchange failed"
+            exit 1
+          fi
+          echo "::add-mask::$GW_TOKEN"
+          GW_HOST=${DATABRICKS_GATEWAY_HOST#https://}
+          GW_HOST=${GW_HOST%%/*}
+          echo "::add-mask::$GW_HOST"
+          GW_TAGS=$(jq -cn --arg repository "$GITHUB_REPOSITORY" --arg task sbx-spike-e2e '{$repository, $task}')
+
+          cat > /tmp/nginx.conf <<CONF
+          events {}
+          http {
+            access_log /dev/stdout;
+            server {
+              listen 80;
+              location / {
+                proxy_pass https://${GW_HOST}/ai-gateway/anthropic/;
+                proxy_set_header Host ${GW_HOST};
+                proxy_set_header Authorization "Bearer ${GW_TOKEN}";
+                proxy_set_header Databricks-Ai-Gateway-Request-Tags '${GW_TAGS}';
+                proxy_http_version 1.1;
+                proxy_buffering off;
+                proxy_request_buffering off;
+                proxy_read_timeout 600s;
+                proxy_ssl_server_name on;
+              }
+            }
+          }
+          CONF
+          chmod 600 /tmp/nginx.conf
+
+          docker run -d --name gw-proxy -p 8080:80 \
+            -v /tmp/nginx.conf:/etc/nginx/nginx.conf:ro \
+            nginx:1.29-alpine
+          sleep 3
+          docker ps --filter name=gw-proxy --format '{{.Status}}'
+
+      - name: Prepare the workspace
+        run: |
+          git clone --local --quiet "$GITHUB_WORKSPACE" /tmp/e2e-work
+          chmod -R a+rwX /tmp/e2e-work
+          mkdir -p /tmp/e2e-work/out
+
+      - name: Run the review agent end to end
+        id: e2e
+        continue-on-error: true
+        env:
+          PROMPT: |
+            You are in a sandbox with the mlflow repo mounted at /work. Boot the dev server and screenshot its home page.
+
+            1. cd /work
+            2. Seed demo data so the page is not empty:
+               uv run python -c "from mlflow.demo import generate_all_demos; generate_all_demos(refresh=True)"
+            3. Start the server in the background:
+               uv run dev/run_dev_server.py --stub-providers claude > /work/out/dev-server.log 2>&1 &
+            4. Poll /work/out/dev-server.log for a line like "Frontend: http://localhost:PORT". This can take
+               several minutes because it runs yarn install and uv sync first. Wait for the URL to answer a
+               curl before continuing, and check the port in the log rather than assuming 3000.
+            5. Use agent-browser to open that URL and save a screenshot to /work/out/home.png
+            6. Print the resolved URL, then confirm /work/out/home.png exists and is non-empty.
+
+            If a step fails, print the last 50 lines of /work/out/dev-server.log and stop.
+        run: |
+          EXIT_CODE=0
+          # host-gateway reaches the published proxy from the default bridge.
+          # The only credential in here is a worthless placeholder.
+          timeout 45m docker run --rm --runtime=runsc \
+            --add-host gw-proxy:host-gateway \
+            -v /tmp/e2e-work:/work -w /work \
+            -e ANTHROPIC_BASE_URL=http://gw-proxy:8080 \
+            -e ANTHROPIC_AUTH_TOKEN=placeholder-not-a-real-credential \
+            -e ANTHROPIC_DEFAULT_SONNET_MODEL=databricks-claude-sonnet-5 \
+            -e ANTHROPIC_DEFAULT_OPUS_MODEL=databricks-claude-opus-5 \
+            -e CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 \
+            -e MLFLOW_TRACKING_URI=sqlite:////tmp/mlflow.db \
+            -e CI=false \
+            mlflow-sandbox:spike \
+            claude --model databricks-claude-sonnet-5 \
+              --max-budget-usd 5 \
+              --dangerously-skip-permissions \
+              --print --verbose --output-format stream-json \
+              "$PROMPT" \
+            | .claude/scripts/stream.sh /tmp/e2e-work/out/agent.jsonl || EXIT_CODE=$?
+          if [ "$EXIT_CODE" -eq 124 ]; then
+            echo "::warning::the agent timed out after 45 minutes"
+          fi
+          exit "$EXIT_CODE"
+
+      - name: Proxy access log
+        if: always()
+        run: docker logs gw-proxy 2>&1 | tail -25
+
+      - name: Collect
+        if: always()
+        run: ls -la /tmp/e2e-work/out || true
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: e2e-output
+          path: /tmp/e2e-work/out
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f gw-proxy || true
