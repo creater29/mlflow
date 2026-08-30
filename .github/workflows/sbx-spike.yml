@@ -538,3 +538,133 @@ jobs:
           path: /tmp/runtime-out
           if-no-files-found: warn
           retention-days: 1
+
+  # Spike 6. The credential property without sbx. sbx needs TLS interception
+  # because it substitutes into arbitrary hosts; we own ANTHROPIC_BASE_URL, so a
+  # single plaintext hop to a proxy that adds the header is enough. The container
+  # gets no bearer at all, which is strictly stronger than holding a placeholder.
+  proxy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Build the image
+        run: docker build -f dev/Dockerfile.sandbox -t mlflow-sandbox:spike .
+
+      - name: Install gVisor
+        run: |
+          curl -fsSL https://gvisor.dev/archive.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+            | sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y runsc
+          sudo runsc install
+          sudo systemctl restart docker
+
+      - name: Start the injecting proxy
+        env:
+          DATABRICKS_GATEWAY_HOST: ${{ secrets.DATABRICKS_GATEWAY_HOST }}
+          DATABRICKS_GATEWAY_CLIENT_ID: ${{ secrets.DATABRICKS_GATEWAY_CLIENT_ID }}
+          DATABRICKS_GATEWAY_CLIENT_SECRET: ${{ secrets.DATABRICKS_GATEWAY_CLIENT_SECRET }}
+        run: |
+          GW_TOKEN=$(curl -sS --max-time 15 \
+            -u "$DATABRICKS_GATEWAY_CLIENT_ID:$DATABRICKS_GATEWAY_CLIENT_SECRET" \
+            -d grant_type=client_credentials -d scope=ai-gateway \
+            "$DATABRICKS_GATEWAY_HOST/oidc/v1/token" | jq -r '.access_token // empty')
+          if [ -z "$GW_TOKEN" ]; then
+            echo "::error::gateway token exchange failed"
+            exit 1
+          fi
+          echo "::add-mask::$GW_TOKEN"
+          GW_HOST=${DATABRICKS_GATEWAY_HOST#https://}
+          GW_HOST=${GW_HOST%%/*}
+          echo "::add-mask::$GW_HOST"
+          GW_TAGS=$(jq -cn --arg repository "$GITHUB_REPOSITORY" --arg task sbx-spike '{$repository, $task}')
+
+          # No nginx variables here, so the heredoc can expand freely. Buffering
+          # off in both directions: the API is SSE, and a proxy that batches it
+          # would stall the agent rather than fail loudly.
+          cat > /tmp/nginx.conf <<CONF
+          events {}
+          http {
+            access_log /dev/stdout;
+            server {
+              listen 80;
+              location / {
+                proxy_pass https://${GW_HOST}/ai-gateway/anthropic/;
+                proxy_set_header Host ${GW_HOST};
+                proxy_set_header Authorization "Bearer ${GW_TOKEN}";
+                proxy_set_header Databricks-Ai-Gateway-Request-Tags '${GW_TAGS}';
+                proxy_http_version 1.1;
+                proxy_buffering off;
+                proxy_request_buffering off;
+                proxy_read_timeout 600s;
+                proxy_ssl_server_name on;
+              }
+            }
+          }
+          CONF
+          chmod 600 /tmp/nginx.conf
+
+          docker network create spike-net
+          docker run -d --name gw-proxy --network spike-net \
+            -v /tmp/nginx.conf:/etc/nginx/nginx.conf:ro \
+            nginx:1.29-alpine
+          sleep 3
+          docker ps --filter name=gw-proxy --format '{{.Status}}'
+
+      - name: Confirm the proxy reaches the gateway
+        run: |
+          # A bare GET is not a valid API call; a response from the gateway
+          # rather than a connection error is what proves the hop works.
+          docker run --rm --network spike-net curlimages/curl:8.18.0 \
+            -s -o /dev/null -w 'proxy -> gateway: %{http_code}\n' --max-time 20 \
+            http://gw-proxy/v1/messages
+
+      - name: Run claude with no bearer in the container
+        id: proxy-claude
+        continue-on-error: true
+        env:
+          ANTHROPIC_DEFAULT_SONNET_MODEL: databricks-claude-sonnet-5
+          ANTHROPIC_DEFAULT_OPUS_MODEL: databricks-claude-opus-5
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+        run: |
+          # gVisor as well, so this is the combined story: stronger boundary and
+          # no credential inside it.
+          docker run --rm --runtime=runsc --network spike-net \
+            -e ANTHROPIC_BASE_URL=http://gw-proxy \
+            -e ANTHROPIC_DEFAULT_SONNET_MODEL \
+            -e ANTHROPIC_DEFAULT_OPUS_MODEL \
+            -e CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS \
+            mlflow-sandbox:spike bash -lc '
+              set -e
+              if [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] || [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+                echo "FAIL: a credential is present in the container"
+                exit 1
+              fi
+              echo "no bearer and no api key in the container"
+              claude --model databricks-claude-sonnet-5 -p "Reply with exactly: SPIKE6_OK"
+            ' | tee /tmp/proxy-claude.log
+          if grep -q SPIKE6_OK /tmp/proxy-claude.log; then
+            echo "proxy: PASS"
+          else
+            echo "proxy: FAIL"
+            exit 1
+          fi
+
+      - name: Proxy access log
+        if: always()
+        run: docker logs gw-proxy 2>&1 | tail -20
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker rm -f gw-proxy || true
+          docker network rm spike-net || true
