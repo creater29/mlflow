@@ -1,9 +1,11 @@
 name: sbx-spike
 
-# Throwaway spike. Answers one question before any of this is worth wiring into
-# `review`: can a GitHub-hosted runner run a Docker Sandboxes microVM at all?
-# Docker's blog says ubuntu-24.04 works as-is, GitHub's docs say nested
-# virtualization is unsupported, so measure rather than trust either.
+# Throwaway spike, answering two questions before any of this is worth wiring
+# into `review`. First, can a GitHub-hosted runner run a Docker Sandboxes
+# microVM at all? Docker's blog says ubuntu-24.04 works as-is, GitHub's docs say
+# nested virtualization is unsupported, so measure rather than trust either.
+# Second, can Claude run non-interactively inside one? See the block further
+# down for that.
 # `push` as well as `workflow_dispatch`: the dispatch trigger only registers
 # once the file is on the default branch, and this should not land on master
 # just to be run once.
@@ -98,6 +100,72 @@ jobs:
             echo "$host -> $code"
           done
 
+      # Spike 2 starts here. Question: can Claude run non-interactively inside a
+      # sandbox? docker/sbx-releases#53 reports that a login shell works while
+      # `sbx run` and direct `exec` both fail with "Not logged in", which is
+      # exactly the shape `review` needs. Uses the API key rather than the
+      # gateway so a failure isolates to #53 and not to Databricks.
+      - name: Store the Anthropic credential
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.EXPERIMENTAL_ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::EXPERIMENTAL_ANTHROPIC_API_KEY is empty"
+            exit 1
+          fi
+          printf '%s' "$ANTHROPIC_API_KEY" | sbx secret set anthropic
+          sbx secret ls
+
+      - name: Create the claude sandbox
+        run: |
+          echo "y" | sbx create claude "$GITHUB_WORKSPACE" --name claude-spike
+          # Reports `none` when no credential reached the VM, which is what the
+          # local run showed before any secret was stored.
+          # shellcheck disable=SC2016  # must expand inside the VM, not here
+          sbx exec claude-spike bash -lc 'echo "SBX_CRED_ANTHROPIC_MODE=$SBX_CRED_ANTHROPIC_MODE"'
+
+      # All three shapes, each allowed to fail, so one run reports which work
+      # instead of stopping at the first failure.
+      - name: Run claude three ways
+        id: three-ways
+        continue-on-error: true
+        run: |
+          marker="SPIKE2_OK"
+          prompt="Reply with exactly: $marker"
+          rc=0
+
+          try() {
+            local label=$1
+            shift
+            local out
+            if out=$(timeout 300 "$@" 2>&1); then
+              if grep -q "$marker" <<<"$out"; then
+                echo "$label: PASS"
+                return 0
+              fi
+              echo "$label: RAN BUT NO MARKER"
+            else
+              echo "$label: FAIL (exit $?)"
+            fi
+            # Trimmed: the reply is short, and a failure message is what matters.
+            sed -n '1,10p' <<<"$out" | sed 's/^/    /'
+            return 1
+          }
+
+          try "sbx run (what review needs)" sbx run --name claude-spike -- -p "$prompt" || rc=1
+          try "sbx exec claude (direct)" sbx exec claude-spike claude -p "$prompt" || rc=1
+          try "sbx exec bash -lc (login shell)" sbx exec claude-spike bash -lc "claude -p '$prompt'" || rc=1
+
+          exit "$rc"
+
+      - name: Summarize
+        if: always()
+        env:
+          OUTCOME: ${{ steps.three-ways.outcome }}
+        run: |
+          echo "three-ways outcome: $OUTCOME"
+          echo "A failure here is the expected shape of docker/sbx-releases#53."
+
       - name: Diagnostics
         if: always()
         run: |
@@ -107,5 +175,7 @@ jobs:
       - name: Tear down
         if: always()
         run: |
-          sbx stop spike || true
-          sbx rm --force spike || true
+          for s in spike claude-spike; do
+            sbx stop "$s" || true
+            sbx rm --force "$s" || true
+          done
