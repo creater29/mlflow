@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+
+FROM docker/sandbox-templates:claude-code-minimal-0.5.0@sha256:be6b18b5990e89c06e775f2963b7cfd56c0cf0dfca981621a777b40b87ad9058
+
+ARG NODE_VERSION=24.19.0
+ARG NODE_SHA256=f625d97cd707df4ff96254916fbc5ff014f09c09effe5a1e0ca8f6d41a8789d4
+ARG NPM_VERSION=12.0.1
+ARG YARN_VERSION=1.22.22
+
+COPY --from=ghcr.io/astral-sh/uv:0.11.14 /uv /uvx /usr/local/bin/
+
+USER root
+
+# The base has no xz, hence the .tar.gz. Checksum from
+# https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt.
+RUN curl -fsSL --retry 3 "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz" -o /tmp/node.tar.gz \
+  && echo "${NODE_SHA256}  /tmp/node.tar.gz" | sha256sum -c - \
+  && tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 --no-same-owner \
+  && rm /tmp/node.tar.gz \
+  && npm install -g "npm@${NPM_VERSION}" "yarn@${YARN_VERSION}"
+
+USER agent
+
+# CI=true satisfies the script's own guard. `--with-deps` sudo-installs the 24
+# shared libraries Chrome links against that this base does not carry.
+COPY .claude/scripts/install-agent-browser.sh /tmp/install-agent-browser.sh
+RUN CI=true bash /tmp/install-agent-browser.sh \
+  && agent-browser install --with-deps

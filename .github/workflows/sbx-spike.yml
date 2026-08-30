@@ -266,3 +266,131 @@ jobs:
             sbx stop "$s" || true
             sbx rm --force "$s" || true
           done
+
+  # Spike 4. The custom template image, driving a real task: boot the dev server
+  # and screenshot it. Separate job because it needs a checkout, and the sbx
+  # setup is copied rather than shared since this is throwaway; a composite
+  # action under .github/actions is the right shape if any of this lands.
+  ui:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Install docker-sbx
+        run: |
+          if ! lsmod | grep -q kvm || [ ! -e /dev/kvm ]; then
+            echo "::error::no KVM on this runner"
+            exit 1
+          fi
+          curl -fsSL https://get.docker.com | sudo REPO_ONLY=1 sh
+          sudo apt-get install -y docker-sbx
+          sudo chmod 666 /dev/kvm
+
+      - name: Start daemon and authenticate
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PAT: ${{ secrets.DOCKER_PAT }}
+        run: |
+          nohup sbx daemon start > /tmp/sbx-daemon.log 2>&1 &
+          for _ in $(seq 30); do
+            if sbx daemon status 2>/dev/null | grep -qi running; then
+              break
+            fi
+            sleep 1
+          done
+          printf '%s' "$DOCKER_PAT" | docker login --username "$DOCKER_USERNAME" --password-stdin
+          printf '%s' "$DOCKER_PAT" | sbx login --username "$DOCKER_USERNAME" --password-stdin
+          sbx policy init balanced
+
+      # No registry round trip: `template load` takes the image straight from a
+      # tar, so the spike needs no push credentials.
+      - name: Build and load the custom template
+        run: |
+          docker build -f dev/Dockerfile.sandbox -t mlflow-sandbox:spike .
+          docker save mlflow-sandbox:spike -o /tmp/mlflow-sandbox.tar
+          sbx template load /tmp/mlflow-sandbox.tar
+          sbx template ls
+
+      - name: Store the Anthropic credential
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.EXPERIMENTAL_ANTHROPIC_API_KEY }}
+        run: printf '%s' "$ANTHROPIC_API_KEY" | sbx secret set anthropic
+
+      - name: Create the sandbox from the custom image
+        env:
+          MLFLOW_TRACKING_URI: sqlite:////tmp/ui-spike/mlflow.db
+          # The CRA dev server treats warnings as errors when CI=true.
+          CI: "false"
+        run: |
+          # The mount is the runner's checkout, owned by a different uid than the
+          # image's `agent` user, and the dev server writes into it.
+          sudo chmod -R a+rwX "$GITHUB_WORKSPACE"
+          echo "y" | sbx create -t mlflow-sandbox:spike claude "$GITHUB_WORKSPACE" \
+            --name ui-spike -e MLFLOW_TRACKING_URI -e CI
+
+      - name: Verify the image carries the toolchain
+        run: |
+          # shellcheck disable=SC2016  # must expand inside the VM, not here
+          sbx exec ui-spike bash -lc '
+            for c in uv node npm yarn agent-browser claude; do
+              printf "%s: " "$c"
+              command -v "$c" >/dev/null 2>&1 && "$c" --version 2>&1 | head -1 || echo MISSING
+            done
+          '
+
+      - name: Ask claude to boot the server and screenshot the home page
+        id: ui-task
+        continue-on-error: true
+        env:
+          PROMPT: |
+            You are in a sandbox with the mlflow repo mounted. Boot the dev server and screenshot its home page.
+
+            1. cd to the repo root (the directory containing pyproject.toml and dev/run_dev_server.py).
+            2. Seed demo data so the page is not empty:
+               uv run python -c "from mlflow.demo import generate_all_demos; generate_all_demos(refresh=True)"
+            3. Start the server in the background:
+               uv run dev/run_dev_server.py --stub-providers claude > /tmp/dev-server.log 2>&1 &
+            4. Poll /tmp/dev-server.log for a line like "Frontend: http://localhost:PORT". This can take
+               several minutes because it runs yarn install and uv sync first. Wait for the URL to answer
+               a curl before continuing.
+            5. Use agent-browser to open that URL and save a screenshot to /tmp/home.png.
+            6. Print the resolved URL, then confirm /tmp/home.png exists and is non-empty.
+
+            If a step fails, print the last 50 lines of /tmp/dev-server.log and stop.
+        run: |
+          # Permissive by design: the isolation is the microVM, which is the whole
+          # reason for running the agent in one.
+          timeout 45m sbx exec ui-spike claude \
+            --model claude-sonnet-5 \
+            --max-budget-usd 5 \
+            --dangerously-skip-permissions \
+            --print \
+            "$PROMPT"
+
+      - name: Copy the screenshot out
+        if: always()
+        run: |
+          mkdir -p /tmp/spike-out
+          sbx cp ui-spike:/tmp/home.png /tmp/spike-out/home.png || echo "no screenshot produced"
+          sbx exec ui-spike bash -lc 'tail -50 /tmp/dev-server.log' > /tmp/spike-out/dev-server.log 2>&1 || true
+          ls -la /tmp/spike-out
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: ui-spike-output
+          path: /tmp/spike-out
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Tear down
+        if: always()
+        run: |
+          sbx stop ui-spike || true
+          sbx rm --force ui-spike || true
