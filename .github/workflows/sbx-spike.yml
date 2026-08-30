@@ -619,6 +619,25 @@ jobs:
             nginx:1.29-alpine
           sleep 3
           docker ps --filter name=gw-proxy --format '{{.Status}}'
+          # gVisor brings its own network stack and owns loopback inside the
+          # sandbox, so Docker's embedded resolver at 127.0.0.11 is unreachable
+          # and the container name does not resolve. Pin the address instead.
+          PROXY_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' gw-proxy)
+          echo "PROXY_IP=$PROXY_IP" >> "$GITHUB_ENV"
+
+      # Isolates the DNS failure from everything else: the same request by name
+      # and by address, under the runtime that could not reach the proxy.
+      - name: Name resolution under gVisor
+        continue-on-error: true
+        run: |
+          echo "--- by name (expected to fail under runsc) ---"
+          docker run --rm --runtime=runsc --network spike-net curlimages/curl:8.18.0 \
+            -s -o /dev/null -w 'by name: %{http_code}\n' --max-time 20 \
+            http://gw-proxy/v1/messages || echo "by name: unreachable"
+          echo "--- by address ---"
+          docker run --rm --runtime=runsc --network spike-net curlimages/curl:8.18.0 \
+            -s -o /dev/null -w 'by address: %{http_code}\n' --max-time 20 \
+            "http://${PROXY_IP}/v1/messages" || echo "by address: unreachable"
 
       - name: Confirm the proxy reaches the gateway
         run: |
@@ -639,6 +658,7 @@ jobs:
           # gVisor as well, so this is the combined story: stronger boundary and
           # no credential inside it.
           docker run --rm --runtime=runsc --network spike-net \
+            --add-host "gw-proxy:${PROXY_IP}" \
             -e ANTHROPIC_BASE_URL=http://gw-proxy \
             -e ANTHROPIC_AUTH_TOKEN=placeholder-not-a-real-credential \
             -e ANTHROPIC_DEFAULT_SONNET_MODEL \
