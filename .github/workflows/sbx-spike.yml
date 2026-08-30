@@ -1,0 +1,111 @@
+name: sbx-spike
+
+# Throwaway spike. Answers one question before any of this is worth wiring into
+# `review`: can a GitHub-hosted runner run a Docker Sandboxes microVM at all?
+# Docker's blog says ubuntu-24.04 works as-is, GitHub's docs say nested
+# virtualization is unsupported, so measure rather than trust either.
+# `push` as well as `workflow_dispatch`: the dispatch trigger only registers
+# once the file is on the default branch, and this should not land on master
+# just to be run once.
+on:
+  workflow_dispatch:
+  push:
+    branches: [sbx-spike]
+
+defaults:
+  run:
+    shell: bash
+
+permissions: {}
+
+jobs:
+  preflight:
+    # Pinned rather than `ubuntu-latest`: docker-sbx requires Ubuntu 24.04+, and
+    # the KVM device this depends on is exactly what is under test.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions: {}
+    steps:
+      - name: Check KVM availability
+        run: |
+          if ! lsmod | grep -q kvm; then
+            echo "::error::KVM kernel module is not loaded; docker-sbx cannot run here"
+            exit 1
+          fi
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing; docker-sbx cannot run here"
+            exit 1
+          fi
+          ls -l /dev/kvm
+          lsmod | grep kvm
+
+      - name: Install docker-sbx
+        run: |
+          # REPO_ONLY, since the runner already has Docker Engine.
+          curl -fsSL https://get.docker.com | sudo REPO_ONLY=1 sh
+          sudo apt-get install -y docker-sbx
+          sbx version
+          # The device exists but is not writable by the runner user.
+          sudo chmod 666 /dev/kvm
+
+      - name: Start daemon and authenticate
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PAT: ${{ secrets.DOCKER_PAT }}
+        run: |
+          nohup sbx daemon start > /tmp/sbx-daemon.log 2>&1 &
+          for _ in $(seq 30); do
+            if sbx daemon status 2>/dev/null | grep -qi running; then
+              break
+            fi
+            sleep 1
+          done
+          if ! sbx daemon status 2>/dev/null | grep -qi running; then
+            echo "::error::sbx daemon did not start"
+            cat /tmp/sbx-daemon.log >&2
+            exit 1
+          fi
+          # Two separate sessions: the Docker CLI's and sbx's own. sbx refuses to
+          # operate unauthenticated even though the template images are public.
+          printf '%s' "$DOCKER_PAT" | docker login --username "$DOCKER_USERNAME" --password-stdin
+          printf '%s' "$DOCKER_PAT" | sbx login --username "$DOCKER_USERNAME" --password-stdin
+
+      # `balanced` rather than the `allow-all` gh-aw falls back to, so this also
+      # reports whether deny-by-default egress is compatible with a workspace
+      # mount. gh-aw's script claims allow-all is "required for mount policy".
+      - name: Initialize network policy
+        run: sbx policy init balanced
+
+      - name: Create sandbox and verify the workspace mount
+        run: |
+          echo "sbx-spike-marker" > "$GITHUB_WORKSPACE/marker.txt"
+          echo "y" | sbx create shell --name spike "$GITHUB_WORKSPACE"
+          sbx exec spike uname -a
+          # Proves the mount is readable inside the microVM, not just that the
+          # VM booted.
+          got=$(sbx exec spike cat "$GITHUB_WORKSPACE/marker.txt" | tr -d '\r\n')
+          if [ "$got" != "sbx-spike-marker" ]; then
+            echo "::error::workspace mount not readable inside the sandbox (got '$got')"
+            exit 1
+          fi
+          echo "workspace mount verified"
+
+      - name: Report egress under the balanced policy
+        continue-on-error: true
+        run: |
+          for host in https://api.anthropic.com https://pypi.org https://example.com; do
+            code=$(sbx exec spike curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$host" || echo "err")
+            echo "$host -> $code"
+          done
+
+      - name: Diagnostics
+        if: always()
+        run: |
+          sbx diagnose || true
+          cat /tmp/sbx-daemon.log || true
+
+      - name: Tear down
+        if: always()
+        run: |
+          sbx stop spike || true
+          sbx rm --force spike || true
