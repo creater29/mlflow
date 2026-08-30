@@ -542,7 +542,7 @@ jobs:
   # Spike 6. The credential property without sbx. sbx needs TLS interception
   # because it substitutes into arbitrary hosts; we own ANTHROPIC_BASE_URL, so a
   # single plaintext hop to a proxy that adds the header is enough. The container
-  # gets no bearer at all, which is strictly stronger than holding a placeholder.
+  # holds only a worthless placeholder, which nginx replaces on the way out.
   proxy:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -640,16 +640,23 @@ jobs:
           # no credential inside it.
           docker run --rm --runtime=runsc --network spike-net \
             -e ANTHROPIC_BASE_URL=http://gw-proxy \
+            -e ANTHROPIC_AUTH_TOKEN=placeholder-not-a-real-credential \
             -e ANTHROPIC_DEFAULT_SONNET_MODEL \
             -e ANTHROPIC_DEFAULT_OPUS_MODEL \
             -e CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS \
             mlflow-sandbox:spike bash -lc '
               set -e
-              if [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] || [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-                echo "FAIL: a credential is present in the container"
+              # The CLI refuses to start without one, so the container holds a
+              # worthless placeholder that nginx overwrites on the way out.
+              if [ "${ANTHROPIC_AUTH_TOKEN:-}" != "placeholder-not-a-real-credential" ]; then
+                echo "FAIL: expected the placeholder, got something else"
                 exit 1
               fi
-              echo "no bearer and no api key in the container"
+              if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+                echo "FAIL: a real api key is present in the container"
+                exit 1
+              fi
+              echo "container holds only the placeholder: $ANTHROPIC_AUTH_TOKEN"
               claude --model databricks-claude-sonnet-5 -p "Reply with exactly: SPIKE6_OK"
             ' | tee /tmp/proxy-claude.log
           if grep -q SPIKE6_OK /tmp/proxy-claude.log; then
